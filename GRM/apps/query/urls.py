@@ -18,6 +18,9 @@ router.register(r'scheduled-tasks', views.ScheduledQueryTaskViewSet)
 urlpatterns = [
     # This path serves the main HTML page at the root URL (e.g., /query/)
     path('', views.query_builder_page, name='query_builder_page'),
+    
+    # Scheduled task management page
+    path('scheduled-tasks/', views.scheduled_task_page, name='scheduled_task_page'),
 
     # This is the path for your original API that executes the SQL query
     path('api/query/', views.query_builder_api, name='query_builder_api'),

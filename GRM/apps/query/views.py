@@ -21,6 +21,10 @@ def query_builder_page(request):
     """This view serves the main HTML page."""
     return render(request, 'index.html')
 
+@ensure_csrf_cookie
+def scheduled_task_page(request):
+    """This view serves the scheduled task management page."""
+    return render(request, 'scheduled_task_form.html')
 def dictfetchall(cursor):
     """Return all rows from a cursor as a list of dictionaries."""
     columns = [col[0] for col in cursor.description]
