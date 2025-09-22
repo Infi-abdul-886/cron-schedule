@@ -6,12 +6,15 @@ from django.db import connection
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 import json
-from .models import QueryTemplate
+from .models import QueryTemplate, QueryFile, ScheduledQueryTask
 from django.shortcuts import get_object_or_404
 from rest_framework import viewsets, permissions
-from .models import QueryTemplate
-from .serializers import QueryTemplateSerializer
+from .serializers import QueryTemplateSerializer, QueryFileSerializer, ScheduledQueryTaskSerializer
 from django.views.decorators.csrf import ensure_csrf_cookie
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from django.contrib.auth.models import User
+import time
 
 @ensure_csrf_cookie
 def query_builder_page(request):
@@ -369,3 +372,79 @@ class QueryTemplateViewSet(viewsets.ModelViewSet):
     queryset = QueryTemplate.objects.all().order_by('name')
     serializer_class = QueryTemplateSerializer
     permission_classes = [permissions.AllowAny]
+
+    def get_queryset(self):
+        queryset = QueryTemplate.objects.select_related('query_file').filter(is_active=True)
+        file_id = self.request.query_params.get('file_id', None)
+        if file_id is not None:
+            queryset = queryset.filter(query_file_id=file_id)
+        return queryset.order_by('query_file__file_name', 'name')
+
+    def perform_create(self, serializer):
+        # Set created_by if user is authenticated
+        if hasattr(self.request, 'user') and self.request.user.is_authenticated:
+            query_file = serializer.validated_data.get('query_file')
+            if not query_file.created_by:
+                query_file.created_by = self.request.user
+                query_file.save()
+        serializer.save()
+
+@method_decorator(csrf_exempt, name='dispatch')
+class QueryFileViewSet(viewsets.ModelViewSet):
+    """
+    API endpoint for managing query files
+    """
+    queryset = QueryFile.objects.filter(is_active=True).order_by('file_name')
+    serializer_class = QueryFileSerializer
+    permission_classes = [permissions.AllowAny]
+
+    def perform_create(self, serializer):
+        # Set created_by to current user or default user
+        user = self.request.user if self.request.user.is_authenticated else User.objects.first()
+        serializer.save(created_by=user)
+
+    @action(detail=True, methods=['get'])
+    def templates(self, request, pk=None):
+        """Get all templates for a specific file"""
+        query_file = self.get_object()
+        templates = query_file.query_templates.filter(is_active=True)
+        serializer = QueryTemplateSerializer(templates, many=True)
+        return Response(serializer.data)
+
+@method_decorator(csrf_exempt, name='dispatch')
+class ScheduledQueryTaskViewSet(viewsets.ModelViewSet):
+    """
+    API endpoint for managing scheduled query tasks
+    """
+    queryset = ScheduledQueryTask.objects.filter(is_active=True).order_by('task_name')
+    serializer_class = ScheduledQueryTaskSerializer
+    permission_classes = [permissions.AllowAny]
+
+    @action(detail=True, methods=['post'])
+    def execute_now(self, request, pk=None):
+        """Execute the scheduled task immediately"""
+        task = self.get_object()
+        from .tasks import execute_scheduled_query_task
+        
+        # Execute the task asynchronously
+        result = execute_scheduled_query_task.delay(task.id)
+        
+        return Response({
+            'message': 'Task execution started',
+            'task_id': result.id,
+            'scheduled_task_id': task.id
+        })
+
+    @action(detail=False, methods=['get'])
+    def available_templates(self, request):
+        """Get all available query templates organized by file"""
+        files = QueryFile.objects.filter(is_active=True).prefetch_related('query_templates')
+        data = []
+        for file in files:
+            templates = file.query_templates.filter(is_active=True)
+            data.append({
+                'file_id': file.id,
+                'file_name': file.file_name,
+                'templates': QueryTemplateSerializer(templates, many=True).data
+            })
+        return Response(data)

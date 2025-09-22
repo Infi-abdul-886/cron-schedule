@@ -1,267 +1,326 @@
-from celery import shared_task,group,states
+from celery import shared_task
+from django.core.mail import send_mail
+from django.template.loader import render_to_string
+from django.conf import settings
+import json
+import csv
+import io
 import time
-from django.utils import timezone
-from .views.adminNotificationView import AdminNotificationView,AdminNotificationRunner
-from datetime import timedelta
-from celery.exceptions import Ignore
-from celery.signals import task_revoked # ✅ ADD THIS IMPORT
-from .models import JobProgress, TaskLog
+from datetime import datetime
+from .models import ScheduledQueryTask, QueryExecutionLog, QueryTemplate
+from .views import query_builder_api
+from django.test import RequestFactory
+from django.http import JsonResponse
 
-@shared_task
-def sample_task():
-    print("Task started")
-    time.sleep(5)
-    print("Task finished")
-    return "Task completed"
-
-@shared_task
-def clean_expired_fares():
-    """
-    Finds and updates all transactions where the fare_expiry_date has passed.
-    """
-    from apps.shared.models.grm_models import TransactionMaster
-
-    # 1. Get the current time. It's crucial to use timezone.now()
-    #    to ensure the comparison is correct based on your project's timezone settings.
-    now = timezone.now()
-
-    # 2. Filter TransactionMaster to get only the objects where the
-    #    fare_expiry_date is less than or equal to the current time.
-    #    We also ensure we are only updating records that don't already have the 'expired' status.
-    expired_fares_query = TransactionMaster.objects.filter(
-        fare_expiry_date__lte=now
-    )
-
-    # 3. Use the .update() method directly on the filtered queryset.
-    #    This is much more efficient than fetching the objects first.
-    #    .update() returns the number of rows that were changed.
-    #    NOTE: You must have a 'status' field in your TransactionMaster model for this to work.
-    count = expired_fares_query.count()
-
-    # 4. Return a clear message indicating how many fares were updated.
-    return f"{count} fares have been marked as expired."
-
-# @shared_task(bind=True, name="tasks.trigger_admin_notification_view")
-# def trigger_admin_notification_view(self, job_id):
-#     """
-#     A managed task that executes the AdminNotificationView logic,
-#     with support for status tracking, locking, and resuming.
-#     """
-#     try:
-#         # 1. Find the corresponding job in the database.
-#         job = JobProgress.objects.get(job_id=job_id)
-#     except JobProgress.DoesNotExist:
-#         # If the job was deleted from the admin, stop the task.
-#         raise Ignore()
-
-#     # 2. Prevent the task from running if it's already running.
-#     if job.status == 'RUNNING':
-#         print(f"Job '{job_id}' is already running. Skipping this run.")
-#         return "Skipped: Already running."
-
-#     # 3. Set the status to 'RUNNING' and record the Celery task ID.
-#     job.status = 'RUNNING'
-#     job.task_id = self.request.id
-#     job.save()
-
-#     try:
-#         # --- YOUR ORIGINAL LOGIC IS PLACED HERE ---
-#         view_instance = AdminNotificationView()
-#         response = view_instance.get(request=None)
-#         # -----------------------------------------
-
-#         # 4. If successful, mark the job as 'COMPLETED'.
-#         job.status = "COMPLETED"
-#         job.save()
-#         TaskLog.objects.create(
-#             job=job, 
-#             task_id=self.request.id, 
-#             message="Admin notifications sent successfully.", 
-#             status="COMPLETED"
-#         )
-        
-#         if hasattr(response, 'content'):
-#             return response.content.decode()
-#         return "Task finished successfully."
-
-#     except Exception as e:
-#         # 5. If any error occurs, mark the job as 'FAILED'.
-#         job.status = "FAILED"
-#         job.save()
-#         TaskLog.objects.create(
-#             job=job, 
-#             task_id=self.request.id, 
-#             message=f"Task failed with error: {e}", 
-#             status="FAILED"
-#         )
-#         # Re-raise the exception so Celery also knows it failed.
-#         raise
-    
-@shared_task(bind=True,name="apps.cronjob.tasks.trigger_admin_notification_view")
-def trigger_admin_notification_view(self, job_id):
-    try:
-        job = JobProgress.objects.get(job_id=job_id)
-    except JobProgress.DoesNotExist:
-        raise Ignore()
-
-    if job.status == "RUNNING":
-        return "Skipped: Already running."
-
-    job.status = "RUNNING"
-    job.task_id = self.request.id
-    job.save(update_fields=["status", "task_id", "updated_at"])
-
-    try:
-        runner = AdminNotificationRunner(job)
-        summary = runner.run()
-
-        job.status = "COMPLETED"
-        job.save(update_fields=["status", "updated_at"])
-        TaskLog.objects.create(job=job, task_id=self.request.id, message="Admin notifications sent.", status="COMPLETED")
-        return summary
-
-    except Exception as e:
-        job.status = "FAILED"
-        job.save(update_fields=["status", "updated_at"])
-        TaskLog.objects.create(job=job, task_id=self.request.id, message=f"Failed: {e}", status="FAILED")
-        raise
-    
-@shared_task(name="tasks.run_all_maintenance_jobs")
-def run_all_maintenance_jobs():
-    """
-    This task runs multiple maintenance jobs in parallel using a group.
-    """
-    # Create a "signature" for each task we want to run.
-    # A signature is just the task definition. .s() is the shorthand for signature.
-    jobs_to_run = group([
-        clean_expired_fares.s(),
-        sample_task.s()
-    ])
-
-    # Call the group. This puts both tasks on the queue at the same time.
-    # The result object represents the entire group.
-    group_result = jobs_to_run.apply_async()
-
-    # This part is optional but useful for seeing the result right away.
-    # .get() will wait until ALL tasks in the group are finished.
-    # Note: Using .get() will block the current process until the result is ready.
-    # In a real scheduled task, you might just let it run in the background.
-    # results = group_result.get()
-    
-    # The 'results' variable will be a list of the return values
-    # from each task in the group.
-    # For example: ['5 fares have been marked as expired.', 'Task finished successfully.']
-    
-    return f"Maintenance group completed with results: {group_result.id}"
-
-@shared_task
-def generate_daily_summary_report():
-    """
-    Generates a summary report of transaction activity from the last 24 hours.
-    """
-    from apps.shared.models.grm_models import TransactionMaster
-
-    now = timezone.now()
-    one_day_ago = now - timedelta(days=1)
-
-    # 1. Count new transactions created in the last 24 hours
-    #    Assumes 'transaction_date' is the creation timestamp.
-    new_transactions_count = TransactionMaster.objects.filter(
-        transaction_date__gte=one_day_ago
-    ).count()
-
-    # 2. Count all fares that are currently active
-    #    Assumes 'active_status = 1' means the fare is active.
-    active_fares_count = TransactionMaster.objects.filter(
-        active_status=1
-    ).count()
-
-    # 3. You could add more stats here, like total expired fares, etc.
-
-    summary = (
-        f"Daily Report: {new_transactions_count} new transactions in the last 24 hours. "
-        f"Total active fares: {active_fares_count}."
-    )
-
-    # --- ARTIFICIAL DELAY ADDED HERE ---
-    print("Report generated. Now waiting for 30 seconds before finishing...")
-    time.sleep(30)
-    # ------------------------------------
-
-    print(f"Finished delay. Returning summary: {summary}")
-    return summary
-
-@task_revoked.connect
-def on_task_revoked(request, terminated, signum, expired, **kwargs):
-    """
-    This function is called by Celery itself whenever a task is terminated.
-    """
-    # We only care about tasks that were forcefully terminated (e.g., from Flower)
-    if terminated:
-        task_id = request.id
-        print(f"TERMINATION DETECTED for task_id: {task_id}")
-        try:
-            # Find the job in our database using the task_id
-            job = JobProgress.objects.get(task_id=task_id)
-            
-            # Update the status to 'TERMINATED'
-            job.status = 'TERMINATED'
-            job.save()
-
-            # Create a log entry to record what happened
-            TaskLog.objects.create(
-                job=job,
-                task_id=task_id,
-                message=f"Task terminated externally at line {job.last_processed_line}. Signal: {signum}.",
-                status="TERMINATED"
-            )
-            print(f"Successfully updated JobProgress '{job.job_id}' to TERMINATED.")
-        except JobProgress.DoesNotExist:
-            # This happens if a task that is not a JobProgress job is terminated. Safe to ignore.
-            print(f"Terminated task {task_id} not found in JobProgress. Ignoring.")
-
-
-# YOUR EXISTING TASK (NO CHANGES NEEDED HERE)
 @shared_task(bind=True)
-def process_data_task(self, job_id):
+def execute_scheduled_query_task(self, task_id):
+    """
+    Execute a scheduled query task with multiple templates
+    """
     try:
-        job = JobProgress.objects.get(job_id=job_id)
-    except JobProgress.DoesNotExist:
-        raise Ignore()
+        task = ScheduledQueryTask.objects.get(id=task_id, is_active=True)
+    except ScheduledQueryTask.DoesNotExist:
+        return f"Scheduled task {task_id} not found or inactive"
+
+    results = []
+    factory = RequestFactory()
     
-    if job.status == 'RUNNING':
-        print(f"Job {job_id} is already running. Skipping.")
-        return "Skipped: Already running."
+    # Update last run time
+    task.last_run = datetime.now()
+    task.save()
 
-    job.status = 'RUNNING'
-    job.task_id = self.request.id
-    job.save()
-
-    total_rows = 500
-    if job.total_lines == 0:
-        job.total_lines = total_rows
-        job.save()
-
-    start_line = job.last_processed_line + 1
-
-    try:
-        for line in range(start_line, total_rows + 1):
-            time.sleep(0.05)
-            job.last_processed_line = line
-            job.progress_percent = (line / job.total_lines) * 100
-            job.save(update_fields=["last_processed_line", "progress_percent", "updated_at"])
-            if line % 20 == 0:
-                TaskLog.objects.create(
-                    job=job, task_id=self.request.id,
-                    message=f"Processed line {line}", status="RUNNING"
+    for template in task.query_templates.filter(is_active=True):
+        start_time = time.time()
+        
+        try:
+            # Execute the query using the template configuration
+            request = factory.post('/query/api/query/', 
+                                 data=json.dumps(template.configuration),
+                                 content_type='application/json')
+            
+            # Execute the query
+            response = query_builder_api(request)
+            execution_time = time.time() - start_time
+            
+            if response.status_code == 200:
+                response_data = json.loads(response.content)
+                query_data = response_data.get('data', [])
+                
+                # Log successful execution
+                log = QueryExecutionLog.objects.create(
+                    scheduled_task=task,
+                    query_template=template,
+                    execution_time=execution_time,
+                    row_count=len(query_data),
+                    status='success',
+                    result_data=query_data[:100]  # Store first 100 rows for reference
                 )
+                
+                results.append({
+                    'template': template.get_full_name(),
+                    'status': 'success',
+                    'row_count': len(query_data),
+                    'execution_time': execution_time,
+                    'data': query_data
+                })
+                
+            else:
+                error_data = json.loads(response.content)
+                error_message = error_data.get('error', 'Unknown error')
+                
+                # Log failed execution
+                QueryExecutionLog.objects.create(
+                    scheduled_task=task,
+                    query_template=template,
+                    execution_time=execution_time,
+                    row_count=0,
+                    status='error',
+                    error_message=error_message
+                )
+                
+                results.append({
+                    'template': template.get_full_name(),
+                    'status': 'error',
+                    'error': error_message,
+                    'execution_time': execution_time
+                })
+                
+        except Exception as e:
+            execution_time = time.time() - start_time
+            
+            # Log exception
+            QueryExecutionLog.objects.create(
+                scheduled_task=task,
+                query_template=template,
+                execution_time=execution_time,
+                row_count=0,
+                status='error',
+                error_message=str(e)
+            )
+            
+            results.append({
+                'template': template.get_full_name(),
+                'status': 'error',
+                'error': str(e),
+                'execution_time': execution_time
+            })
 
-        job.status = "COMPLETED"
-        job.save()
-        TaskLog.objects.create(job=job, task_id=self.request.id, message="Job completed", status="COMPLETED")
+    # Send email with results if recipients are configured
+    if task.email_recipients and results:
+        send_query_results_email(task, results)
+
+    return {
+        'task_name': task.task_name,
+        'executed_at': task.last_run.isoformat(),
+        'total_queries': len(results),
+        'successful_queries': len([r for r in results if r['status'] == 'success']),
+        'failed_queries': len([r for r in results if r['status'] == 'error']),
+        'results': results
+    }
+
+def send_query_results_email(task, results):
+    """
+    Send email with query results
+    """
+    try:
+        recipients = [email.strip() for email in task.email_recipients.split(',')]
+        
+        # Prepare email content based on output format
+        if task.output_format == 'json':
+            attachment_content = json.dumps(results, indent=2)
+            attachment_name = f"{task.task_name}_results.json"
+            content_type = 'application/json'
+            
+        elif task.output_format == 'csv':
+            # Convert results to CSV
+            output = io.StringIO()
+            if results and results[0].get('data'):
+                # Use first successful result for CSV structure
+                successful_result = next((r for r in results if r['status'] == 'success'), None)
+                if successful_result and successful_result['data']:
+                    fieldnames = successful_result['data'][0].keys()
+                    writer = csv.DictWriter(output, fieldnames=fieldnames)
+                    writer.writeheader()
+                    
+                    for result in results:
+                        if result['status'] == 'success' and result.get('data'):
+                            writer.writerows(result['data'])
+                            
+            attachment_content = output.getvalue()
+            attachment_name = f"{task.task_name}_results.csv"
+            content_type = 'text/csv'
+            
+        else:  # HTML format
+            html_content = render_query_results_html(task, results)
+            attachment_content = html_content
+            attachment_name = f"{task.task_name}_results.html"
+            content_type = 'text/html'
+
+        # Create email content
+        email_body = f"""
+        Scheduled Query Task: {task.task_name}
+        Executed at: {task.last_run}
+        
+        Summary:
+        - Total queries: {len(results)}
+        - Successful: {len([r for r in results if r['status'] == 'success'])}
+        - Failed: {len([r for r in results if r['status'] == 'error'])}
+        
+        Please find the detailed results in the attachment.
+        """
+
+        # Send email (you might want to use Django's EmailMessage for attachments)
+        from django.core.mail import EmailMessage
+        
+        email = EmailMessage(
+            subject=task.email_subject,
+            body=email_body,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=recipients,
+        )
+        
+        email.attach(attachment_name, attachment_content, content_type)
+        email.send()
+        
     except Exception as e:
-        job.status = "FAILED"
-        job.save()
-        TaskLog.objects.create(job=job, task_id=self.request.id, message=f"Error: {e}", status="FAILED")
-        self.update_state(state=states.FAILURE, meta={'exc': str(e)})
-        raise
+        print(f"Failed to send email for task {task.task_name}: {e}")
+
+def render_query_results_html(task, results):
+    """
+    Render query results as HTML
+    """
+    html = f"""
+    <html>
+    <head>
+        <title>{task.task_name} - Query Results</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            table {{ border-collapse: collapse; width: 100%; margin: 20px 0; }}
+            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+            th {{ background-color: #f2f2f2; }}
+            .error {{ color: red; }}
+            .success {{ color: green; }}
+            .summary {{ background-color: #f9f9f9; padding: 15px; margin: 20px 0; }}
+        </style>
+    </head>
+    <body>
+        <h1>{task.task_name} - Query Results</h1>
+        <div class="summary">
+            <h3>Execution Summary</h3>
+            <p><strong>Executed at:</strong> {task.last_run}</p>
+            <p><strong>Total queries:</strong> {len(results)}</p>
+            <p><strong>Successful:</strong> {len([r for r in results if r['status'] == 'success'])}</p>
+            <p><strong>Failed:</strong> {len([r for r in results if r['status'] == 'error'])}</p>
+        </div>
+    """
+    
+    for result in results:
+        html += f"<h2>{result['template']}</h2>"
+        
+        if result['status'] == 'success':
+            html += f'<p class="success">✓ Success - {result["row_count"]} rows in {result["execution_time"]:.2f}s</p>'
+            
+            if result.get('data') and len(result['data']) > 0:
+                html += "<table>"
+                # Headers
+                html += "<tr>"
+                for key in result['data'][0].keys():
+                    html += f"<th>{key}</th>"
+                html += "</tr>"
+                
+                # Data rows (limit to first 50 for email)
+                for row in result['data'][:50]:
+                    html += "<tr>"
+                    for value in row.values():
+                        html += f"<td>{value}</td>"
+                    html += "</tr>"
+                html += "</table>"
+                
+                if len(result['data']) > 50:
+                    html += f"<p><em>Showing first 50 rows of {len(result['data'])} total rows.</em></p>"
+        else:
+            html += f'<p class="error">✗ Error: {result["error"]}</p>'
+    
+    html += "</body></html>"
+    return html
+
+@shared_task
+def execute_query_template(template_id):
+    """
+    Execute a single query template
+    """
+    try:
+        template = QueryTemplate.objects.get(id=template_id, is_active=True)
+    except QueryTemplate.DoesNotExist:
+        return f"Query template {template_id} not found or inactive"
+
+    factory = RequestFactory()
+    start_time = time.time()
+    
+    try:
+        # Execute the query using the template configuration
+        request = factory.post('/query/api/query/', 
+                             data=json.dumps(template.configuration),
+                             content_type='application/json')
+        
+        response = query_builder_api(request)
+        execution_time = time.time() - start_time
+        
+        if response.status_code == 200:
+            response_data = json.loads(response.content)
+            query_data = response_data.get('data', [])
+            
+            # Log successful execution
+            QueryExecutionLog.objects.create(
+                query_template=template,
+                execution_time=execution_time,
+                row_count=len(query_data),
+                status='success',
+                result_data=query_data[:100]  # Store first 100 rows
+            )
+            
+            return {
+                'template': template.get_full_name(),
+                'status': 'success',
+                'row_count': len(query_data),
+                'execution_time': execution_time,
+                'data': query_data
+            }
+        else:
+            error_data = json.loads(response.content)
+            error_message = error_data.get('error', 'Unknown error')
+            
+            # Log failed execution
+            QueryExecutionLog.objects.create(
+                query_template=template,
+                execution_time=execution_time,
+                row_count=0,
+                status='error',
+                error_message=error_message
+            )
+            
+            return {
+                'template': template.get_full_name(),
+                'status': 'error',
+                'error': error_message,
+                'execution_time': execution_time
+            }
+            
+    except Exception as e:
+        execution_time = time.time() - start_time
+        
+        # Log exception
+        QueryExecutionLog.objects.create(
+            query_template=template,
+            execution_time=execution_time,
+            row_count=0,
+            status='error',
+            error_message=str(e)
+        )
+        
+        return {
+            'template': template.get_full_name(),
+            'status': 'error',
+            'error': str(e),
+            'execution_time': execution_time
+        }

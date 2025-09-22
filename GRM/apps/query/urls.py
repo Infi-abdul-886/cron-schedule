@@ -10,6 +10,8 @@ router = routers.DefaultRouter()
 # 2. Register your QueryTemplateViewSet with the router
 # This tells the router to create URLs for the 'templates' API endpoint
 router.register(r'templates', views.QueryTemplateViewSet)
+router.register(r'files', views.QueryFileViewSet)
+router.register(r'scheduled-tasks', views.ScheduledQueryTaskViewSet)
 
 
 # 3. Define the final URL patterns
