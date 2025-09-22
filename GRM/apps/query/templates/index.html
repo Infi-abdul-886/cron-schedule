@@ -15,8 +15,15 @@
         <div class="form-section template-management-section">
             <h3>Template Management</h3>
             <div class="template-controls">
+                <select id="fileSelect">
+                    <option value="">-- Select a File --</option>
+                </select>
+                <input type="text" id="fileNameInput" placeholder="New file name...">
+                <button type="button" id="createFileBtn">Create File</button>
+            </div>
+            <div class="template-controls">
                 <select id="templateSelect">
-                    <option value="">-- Load a Template --</option>
+                    <option value="">-- Select a File First --</option>
                 </select>
                 <button type="button" id="loadTemplateBtn">Load</button>
                 <input type="text" id="templateNameInput" placeholder="Enter template name...">

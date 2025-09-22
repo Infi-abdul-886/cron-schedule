@@ -51,7 +51,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const BACKEND_URL = "/query/api/query/";
     const TEMPLATE_API_URL = "/query/api/templates/";
+    const FILES_API_URL = "/query/api/files/";
     let currentTemplateId = null;
+    let currentFileId = null;
 
     let allModels = [];
     let allFields = [];
@@ -648,12 +650,47 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const templateSelect = document.getElementById('templateSelect');
     const templateNameInput = document.getElementById('templateNameInput');
+    const fileSelect = document.getElementById('fileSelect');
+    const fileNameInput = document.getElementById('fileNameInput');
+    const createFileBtn = document.getElementById('createFileBtn');
     const loadTemplateBtn = document.getElementById('loadTemplateBtn');
     const saveTemplateBtn = document.getElementById('saveTemplateBtn');
     const deleteTemplateBtn = document.getElementById('deleteTemplateBtn');
 
-    function fetchAndRenderTemplates() {
-        fetch(TEMPLATE_API_URL)
+    function fetchAndRenderFiles() {
+        fetch(FILES_API_URL)
+            .then(r => {
+                if (!r.ok) { throw new Error(`Network response was not ok (${r.status})`); }
+                return r.json();
+            })
+            .then(data => {
+                const currentVal = fileSelect.value;
+                fileSelect.innerHTML = '<option value="">-- Select a File --</option>';
+                data.results.forEach(file => {
+                    const option = document.createElement('option');
+                    option.value = file.id;
+                    option.textContent = `${file.file_name} (${file.query_count} queries)`;
+                    fileSelect.appendChild(option);
+                });
+                fileSelect.value = currentVal;
+                
+                // Update templates when file selection changes
+                if (currentVal) {
+                    fetchTemplatesForFile(currentVal);
+                }
+            }).catch(err => {
+                console.error("Failed to fetch files:", err);
+                setStatusMessage("Error: Could not load files.", "error");
+            });
+    }
+
+    function fetchTemplatesForFile(fileId) {
+        if (!fileId) {
+            templateSelect.innerHTML = '<option value="">-- Select a File First --</option>';
+            return;
+        }
+        
+        fetch(`${TEMPLATE_API_URL}?file_id=${fileId}`)
             .then(r => {
                 if (!r.ok) { throw new Error(`Network response was not ok (${r.status})`); }
                 return r.json();
@@ -674,14 +711,74 @@ document.addEventListener('DOMContentLoaded', () => {
             });
     }
 
+    function fetchAndRenderTemplates() {
+        const fileId = fileSelect.value;
+        if (!fileId) {
+            templateSelect.innerHTML = '<option value="">-- Select a File First --</option>';
+            return;
+        }
+        
+        fetchTemplatesForFile(fileId);
+    }
+    
+    // File selection change handler
+    fileSelect.addEventListener('change', () => {
+        currentFileId = fileSelect.value;
+        fetchAndRenderTemplates();
+        templateNameInput.value = '';
+        currentTemplateId = null;
+    });
+    
+    // Create new file
+    createFileBtn.addEventListener('click', () => {
+        const fileName = fileNameInput.value.trim();
+        if (!fileName) {
+            alert("Please enter a file name.");
+            return;
+        }
+        
+        fetch(FILES_API_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': csrftoken
+            },
+            credentials: 'same-origin',
+            body: JSON.stringify({ 
+                file_name: fileName,
+                description: `Query file: ${fileName}`
+            })
+        })
+        .then(response => {
+            if (!response.ok) {
+                return response.json().then(err => { throw new Error(err.error || err.detail || 'Create failed') });
+            }
+            return response.json();
+        })
+        .then(data => {
+            setStatusMessage(`File '${data.file_name}' created successfully.`, 'success');
+            fileNameInput.value = '';
+            fetchAndRenderFiles();
+            fileSelect.value = data.id;
+            currentFileId = data.id;
+            fetchAndRenderTemplates();
+        })
+        .catch(err => setStatusMessage(`Error: ${err.message}`, 'error'));
+    });
+
     loadTemplateBtn.addEventListener('click', () => {
         const id = templateSelect.value;
-        if (!id) return;
+        if (!id) {
+            alert("Please select a template to load.");
+            return;
+        }
         fetch(`${TEMPLATE_API_URL}${id}/`)
             .then(r => r.json())
             .then(template => {
                 templateNameInput.value = template.name;
                 currentTemplateId = template.id;
+                currentFileId = template.query_file;
+                fileSelect.value = currentFileId;
                 loadQueryState(template.configuration);
                 setStatusMessage(`Template '${template.name}' loaded.`, 'success');
             }).catch(err => setStatusMessage(`Error loading template: ${err}`, 'error'));
@@ -689,10 +786,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     saveTemplateBtn.addEventListener('click', () => {
         const name = templateNameInput.value.trim();
-        if (!name) {
-            alert("Please enter a template name.");
+        const fileId = fileSelect.value;
+        
+        if (!name || !fileId) {
+            alert("Please enter a template name and select a file.");
             return;
         }
+        
         const state = getCurrentQueryState();
         const isUpdating = currentTemplateId && templateSelect.value === currentTemplateId.toString();
 
@@ -711,7 +811,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 'X-CSRFToken': csrftoken
             },
             credentials: 'same-origin', 
-            body: JSON.stringify({ name: name, configuration: state })
+            body: JSON.stringify({ 
+                name: name, 
+                configuration: state,
+                query_file: fileId,
+                description: `Query template: ${name}`
+            })
         })
         .then(response => {
             if (!response.ok) {
@@ -722,6 +827,7 @@ document.addEventListener('DOMContentLoaded', () => {
         .then(data => {
             setStatusMessage(`Template '${data.name}' saved successfully.`, 'success');
             currentTemplateId = data.id;
+            currentFileId = fileId;
             fetchAndRenderTemplates();
         })
         .catch(err => setStatusMessage(`Error: ${err.message}`, 'error'));
@@ -751,5 +857,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }).catch(err => setStatusMessage(`Error: ${err.message}`, 'error'));
     });
 
+    // Initialize
+    fetchAndRenderFiles();
     fetchAndRenderTemplates();
 });
